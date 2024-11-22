@@ -1,18 +1,46 @@
-use colored::Colorize;
 use rustyline::error::ReadlineError;
-use rustyline::Editor;
 use std::env;
-use std::fs;
-use std::io::{self, Write};
 use std::io::{BufRead, BufReader};
-use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
 use std::process::exit;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use tokio::{signal, sync::broadcast};
 
-fn main() -> std::io::Result<()> {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut shutdown_rx = shutdown_signal().await;
+
+    let work_handle = tokio::spawn(async move {
+        tokio::select! {
+            _ = shell() => {},
+            _ = shutdown_rx.recv() => {
+                println!("Work received shutdown signal");
+            }
+        }
+
+        println!("Cleaning up...");
+    });
+
+    // Wait for work to complete
+    work_handle.await?;
+    println!("Shutdown complete");
+
+    Ok(())
+}
+
+async fn shell() -> std::io::Result<()> {
     let blue_prompt = "\x1b[34mRshell> \x1b[0m";
     let mut rl = rustyline::DefaultEditor::new().unwrap();
+
+    let running = Arc::new(AtomicBool::new(true));
+    let r = running.clone();
+
+    ctrlc::set_handler(move || {
+        r.store(false, Ordering::SeqCst);
+        println!("Received Ctrl+C!");
+    })
+    .expect("Error setting Ctrl+C handler");
 
     loop {
         let input = rl.readline(blue_prompt);
@@ -33,8 +61,7 @@ fn main() -> std::io::Result<()> {
                     }
                 };
 
-                let mut command_found = false;
-                for path in path_array {
+                for _ in path_array {
                     match Command::new(inputsplit[0])
                         .args(arguments)
                         .stdout(Stdio::piped())
@@ -75,8 +102,14 @@ fn main() -> std::io::Result<()> {
     }
 }
 
-fn check_file_exists_in_sbin(command_base: &str, dir: &str) -> bool {
-    let final_path = [dir, "/", command_base].join("");
-    let bin_path = Path::new(&final_path);
-    bin_path.exists()
+async fn shutdown_signal() -> broadcast::Receiver<()> {
+    let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+
+    tokio::spawn(async move {
+        signal::ctrl_c().await.expect("Failed to listen for Ctrl+C");
+        println!("\nquitting...");
+        let _ = shutdown_tx.send(());
+    });
+
+    shutdown_rx
 }
